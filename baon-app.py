@@ -113,21 +113,35 @@ else:
         else:
             cols = st.columns(2)
             for i, meal in enumerate(ready_to_cook):
-                with cols[i % 2].expander(f"🍲 {meal['meal_name']}"):
+                m_name = meal['meal_name']
+                # Create a safe, unique key using index + name
+                safe_key = f"ready_btn_{i}_{m_name.replace(' ', '_').lower()}"
+                
+                with cols[i % 2].expander(f"🍲 {m_name}"):
                     for ing in meal['parsed_ings']:
                         st.write(f"{ing['status']} {ing['display']}")
                     
-                    if st.button(f"Cook {meal['meal_name']}", key=f"ready_{meal['meal_name']}"):
-                        # Deduct and Log logic...
-                        for item in str(meal['row']['ingredients_list']).split(","):
-                            if ":" in item:
-                                n, q = item.split(":")
-                                n = n.strip()
-                                new_val = int(pantry_dict[n.lower()]) - int(q.strip())
-                                supabase.table("pantry").update({"amount": new_val}).eq("ingredient", n).execute()
-                        supabase.table("history").insert({"meal_name": meal['meal_name'], "date_cooked": datetime.now().strftime("%Y-%m-%d")}).execute()
-                        st.balloons()
-                        st.rerun()
+                    if st.button(f"Cook {m_name}", key=safe_key):
+                        try:
+                            # Deduct from Supabase
+                            for item in str(meal['row']['ingredients_list']).split(","):
+                                if ":" in item:
+                                    n, q = item.split(":")
+                                    n = n.strip()
+                                    current_qty = pantry_dict.get(n.lower(), 0)
+                                    new_val = current_qty - int(q.strip())
+                                    supabase.table("pantry").update({"amount": new_val}).eq("ingredient", n).execute()
+                            
+                            # Log History
+                            supabase.table("history").insert({
+                                "meal_name": m_name, 
+                                "date_cooked": datetime.now().strftime("%Y-%m-%d")
+                            }).execute()
+                            
+                            st.balloons()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error updating: {e}")
 
     with tab2:
         if not missing_ingredients:
@@ -135,8 +149,14 @@ else:
         else:
             cols = st.columns(2)
             for i, meal in enumerate(missing_ingredients):
-                with cols[i % 2].expander(f"❌ {meal['meal_name']}"):
+                m_name = meal['meal_name']
+                # Create a safe, unique key using index + name
+                safe_key_missing = f"missing_btn_{i}_{m_name.replace(' ', '_').lower()}"
+                
+                with cols[i % 2].expander(f"❌ {m_name}"):
                     st.write("**Missing Items:**")
                     for ing in meal['parsed_ings']:
                         st.write(f"{ing['status']} {ing['display']}")
-                    st.button(f"Cannot Cook (Missing Ingredients)", key=f"missing_{meal['meal_name']}", disabled=True)
+                    
+                    # Disabled button with unique key
+                    st.button(f"Insufficient Stock", key=safe_key_missing, disabled=True)
