@@ -13,20 +13,21 @@ SHEET_URL = "https://docs.google.com/spreadsheets/d/1DgVuak6x-AHQcltPoK8fB25T644
 
 # --- 2. LOAD DATA ---
 try:
-    # Attempting to read both worksheets from your specific URL
-    pantry_df = conn.read(spreadsheet=SHEET_URL, worksheet="Pantry", ttl=0)
-    recipes_df = conn.read(spreadsheet=SHEET_URL, worksheet="Recipes", ttl=0)
+    # This reads the URL directly from your Secrets for maximum security
+    pantry_df = conn.read(worksheet="Pantry", ttl=0)
+    recipes_df = conn.read(worksheet="Recipes", ttl=0)
     
-    # Clean and process data
-    pantry_df = pantry_df.dropna(subset=['Ingredient'])
+    # Check if we actually got data
+    if pantry_df.empty or recipes_df.empty:
+        st.error("The Sheet is connected, but the tabs 'Pantry' or 'Recipes' seem to be empty!")
+        st.stop()
+
     pantry = pantry_df.set_index('Ingredient')['Amount'].to_dict()
     
 except Exception as e:
-    st.error("⚠️ Connection Failed!")
-    st.write("### Specific Error Log:")
-    st.code(f"{e}")
-    st.write("---")
-    st.write("**Quick Check:** Is the sheet shared with your Service Account email as an Editor?")
+    st.error("⚠️ Connection Still Failing")
+    st.info("Check: Did you click 'Share' in the Sheet and add the email as EDITOR?")
+    st.code(f"Error Message: {e}")
     st.stop()
 
 # --- 3. UI RENDER ---
@@ -64,3 +65,4 @@ for _, row in recipes_df.iterrows():
 
 if not found_any:
     st.info("No meals currently available. Check your inventory or add new recipes in Google Sheets!")
+
