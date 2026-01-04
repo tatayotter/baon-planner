@@ -2,33 +2,37 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import datetime, timedelta
+import time
 
 # --- 1. APP CONFIG ---
-st.set_page_config(page_title="Pinoy Baon Master", page_icon="🍱", layout="centered")
+st.set_page_config(page_title="Pinoy Baon Master", page_icon="🍱")
 
 # --- 2. CONNECTION ---
-# Using the connection name from your secrets: [connections.gsheets]
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Load data with ttl=0 to ensure we don't use stale cached data
-try:
-    pantry_df = conn.read(worksheet="Pantry", ttl=0)
-    recipes_df = conn.read(worksheet="Recipes", ttl=0)
+def load_data():
+    # ttl=0 is mandatory to see changes after st.rerun()
+    p_df = conn.read(worksheet="Pantry", ttl=0)
+    r_df = conn.read(worksheet="Recipes", ttl=0)
     try:
-        history_df = conn.read(worksheet="History", ttl=0)
+        h_df = conn.read(worksheet="History", ttl=0)
     except:
-        history_df = pd.DataFrame(columns=['Meal_Name', 'Date_Cooked'])
-except Exception as e:
-    st.error(f"Could not connect to Google Sheets. Check your Secrets and URL. Error: {e}")
-    st.stop()
+        h_df = pd.DataFrame(columns=['Meal_Name', 'Date_Cooked'])
+    return p_df, r_df, h_df
 
-# Prepare Pantry
+pantry_df, recipes_df, history_df = load_data()
+
+# Clean dataframes
 pantry_df = pantry_df.dropna(subset=['Ingredient'])
 pantry = pantry_df.set_index('Ingredient')['Amount'].to_dict()
 
 # --- 3. SORTING LOGIC ---
-history_df['Date_Cooked'] = pd.to_datetime(history_df['Date_Cooked'], errors='coerce')
-five_days_ago = datetime.now() - timedelta(days=5)
+# Force Date_Cooked to string to prevent format mismatch errors
+history_df['Date_Cooked'] = history_df['Date_Cooked'].astype(str)
+today_str = datetime.now().strftime("%Y-%m-%d")
+five_days_ago = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+
+# Find recent meals (String comparison works for YYYY-MM-DD)
 recent_meals = history_df[history_df['Date_Cooked'] > five_days_ago]['Meal_Name'].unique()
 
 def get_score(row):
@@ -41,17 +45,17 @@ sorted_recipes = recipes_df.sort_values(by='Sort_Score', ascending=False)
 
 # --- 4. MAIN UI ---
 st.title("🍱 Pinoy Baon Master")
-picky_mode = st.toggle("Picky Eater Mode (Kids Only)", value=True)
+picky_mode = st.toggle("Picky Eater Mode", value=True)
 
 for index, row in sorted_recipes.iterrows():
-    # Filter Picky
     if picky_mode and str(row.get('Picky_Friendly', 'FALSE')).upper() != 'TRUE':
         continue
     
-    # Check Ingredients
+    # Inline ingredients display
     raw_ing = str(row['Ingredients_List'])
     items = [i.strip() for i in raw_ing.split(",")]
 
+    # Availability Check
     can_cook = True
     for itm in items:
         if ":" in itm:
@@ -66,41 +70,35 @@ for index, row in sorted_recipes.iterrows():
         with st.expander(f"{icon} {row['Meal_Name']}"):
             st.write(f"**Ingredients:** {raw_ing}")
             
-            # --- THE COOK BUTTON ---
-            if st.button(f"Cook {row['Meal_Name']}", key=f"cook_{index}"):
-                # 1. Deduct from local Pantry
+            if st.button(f"Cook {row['Meal_Name']}", key=f"c_{index}"):
+                # 1. Deduct locally
                 for itm in items:
                     if ":" in itm:
                         n, q = itm.split(":")
-                        pantry[n.strip()] = int(pantry.get(n.strip(), 0)) - int(q.strip())
+                        pantry[n.strip()] = int(pantry[n.strip()]) - int(q.strip())
                 
-                # 2. Add to History
+                # 2. Add to History locally (Strictly as Strings)
                 new_entry = pd.DataFrame({
-                    'Meal_Name': [row['Meal_Name']], 
-                    'Date_Cooked': [datetime.now().strftime("%Y-%m-%d")]
+                    'Meal_Name': [str(row['Meal_Name'])], 
+                    'Date_Cooked': [today_str]
                 })
-                # Remove empty rows from history before adding new one
-                clean_history = history_df.dropna(how='all')
-                updated_history = pd.concat([clean_history, new_entry], ignore_index=True)
                 
-                # 3. Create Final DataFrames with HARD HEADERS
-                # These MUST match your Sheet column headers exactly
-                pantry_to_save = pd.DataFrame(list(pantry.items()), columns=['Ingredient', 'Amount'])
-                history_to_save = updated_history[['Meal_Name', 'Date_Cooked']]
+                # Combine and drop any completely empty rows
+                new_history_df = pd.concat([history_df.dropna(how='all'), new_entry], ignore_index=True)
+                new_pantry_df = pd.DataFrame(list(pantry.items()), columns=['Ingredient', 'Amount'])
 
-                # 4. SYNC TO GOOGLE SHEETS
+                # 3. PUSH TO GOOGLE SHEETS
                 try:
-                    conn.update(worksheet="Pantry", data=pantry_to_save)
-                    conn.update(worksheet="History", data=history_to_save)
+                    # Explicitly update both sheets
+                    conn.update(worksheet="Pantry", data=new_pantry_df)
+                    conn.update(worksheet="History", data=new_history_df)
                     
-                    st.success("Updating Google Sheets...")
+                    st.success(f"Deducted ingredients & logged {row['Meal_Name']}!")
                     st.balloons()
-                    # Wait a moment for Google to finish writing
-                    import time
-                    time.sleep(1)
+                    time.sleep(1) # Give Google time to sync
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Update failed. This is usually a permission or header error: {e}")
+                    st.error(f"Sync failed: {e}")
 
 # --- 5. SIDEBAR ---
 with st.sidebar:
@@ -109,4 +107,4 @@ with st.sidebar:
     
     st.header("📜 History")
     if not history_df.empty:
-        st.write(history_df.sort_values(by='Date_Cooked', ascending=False).head(5))
+        st.write(history_df.tail(5))
