@@ -16,21 +16,29 @@ def load_all_data():
         p_res = supabase.table("pantry").select("*").execute()
         r_res = supabase.table("recipes").select("*").execute()
         h_res = supabase.table("history").select("*").execute()
+        pl_res = supabase.table("planner").select("*").execute()
         
         p_df = pd.DataFrame(p_res.data) if p_res.data else pd.DataFrame(columns=['ingredient', 'amount'])
         r_df = pd.DataFrame(r_res.data) if r_res.data else pd.DataFrame()
         h_df = pd.DataFrame(h_res.data) if h_res.data else pd.DataFrame(columns=['meal_name', 'date_cooked'])
         
-        for df in [p_df, r_df, h_df]:
+        # Planner sorting
+        pl_df = pd.DataFrame(pl_res.data) if pl_res.data else pd.DataFrame(columns=['day_name', 'meal_name'])
+        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        if not pl_df.empty:
+            pl_df['day_name'] = pd.Categorical(pl_df['day_name'], categories=day_order, ordered=True)
+            pl_df = pl_df.sort_values('day_name')
+                
+        for df in [p_df, r_df, h_df, pl_df]:
             if not df.empty:
                 df.columns = [str(c).lower().strip().replace(" ", "_") for c in df.columns]
                 
-        return p_df, r_df, h_df
+        return p_df, r_df, h_df, pl_df
     except Exception as e:
         st.error(f"Database Error: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-p_df, r_df, h_df = load_all_data()
+p_df, r_df, h_df, pl_df = load_all_data()
 pantry_dict = {str(k).lower().strip(): v for k, v in p_df.set_index('ingredient')['amount'].to_dict().items()} if not p_df.empty else {}
 
 # --- 3. COOLDOWN LOGIC ---
@@ -55,27 +63,91 @@ with st.sidebar:
     if not h_df.empty:
         st.dataframe(h_df.sort_values('date_cooked', ascending=False).head(10), hide_index=True)
 
-# --- 5. MAIN UI ---
+# --- 5. WEEKLY MENU BOARD ---
 st.title("🍱 Pinoy Baon Master")
+
+header_col, btn_col = st.columns([4, 1])
+with header_col:
+    st.header("🗓️ This Week's School Menu")
+with btn_col:
+    st.write("##") 
+    if st.button("🗑️ Clear Week"):
+        supabase.table("planner").update({"meal_name": None}).neq("day_name", "dummy").execute()
+        st.toast("Menu cleared!")
+        st.rerun()
+
+plan_cols = st.columns(5)
+days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+
+for i, day in enumerate(days):
+    with plan_cols[i]:
+        st.markdown(f"**{day}**")
+        current_row = pl_df[pl_df['day_name'] == day]
+        current_val = current_row['meal_name'].values[0] if not current_row.empty and pd.notna(current_row['meal_name'].values[0]) else "None"
+        
+        recipe_options = ["None"] + sorted(r_df['meal_name'].tolist()) if not r_df.empty else ["None"]
+        try:
+            current_index = recipe_options.index(current_val)
+        except ValueError:
+            current_index = 0
+
+        choice = st.selectbox(f"Assign {day}", recipe_options, index=current_index, key=f"plan_{day}", label_visibility="collapsed")
+        
+        if choice != current_val:
+            new_val = choice if choice != "None" else None
+            supabase.table("planner").upsert({"day_name": day, "meal_name": new_val}).execute()
+            st.rerun()
+
+st.divider()
+
+# --- 6. SMART SHOPPING LIST (Based on Planner) ---
+planned_meals = pl_df[pl_df['meal_name'].notna()]['meal_name'].tolist()
+
+with st.expander("🛒 Smart Shopping List", expanded=True):
+    if not planned_meals:
+        st.info("Assign meals to the school days above to see what you need to buy!")
+    else:
+        needed_total = {}
+        for meal in planned_meals:
+            recipe_row = r_df[r_df['meal_name'] == meal]
+            if not recipe_row.empty:
+                raw_ings = str(recipe_row.iloc[0].get('ingredients_list', '')).split(",")
+                for item in raw_ings:
+                    if ":" in item:
+                        name, qty = item.split(":")
+                        name = name.strip().lower()
+                        needed_total[name] = needed_total.get(name, 0) + int(qty.strip())
+        
+        shopping_output = ""
+        for name, req_qty in needed_total.items():
+            have_qty = pantry_dict.get(name, 0)
+            if have_qty < req_qty:
+                shortfall = req_qty - have_qty
+                st.checkbox(f"**{name.title()}**: Buy {shortfall} (Need {req_qty}, Have {have_qty})", key=f"shop_{name}")
+                shopping_output += f"- {name.title()}: {shortfall}\n"
+        
+        if not shopping_output:
+            st.success("✅ You have everything needed for this week's planned menu!")
+        else:
+            st.caption("Copy for Viber/Notes:")
+            st.code(shopping_output, language="text")
+
+# --- 7. MAIN UI TABS ---
 picky_mode = st.toggle("Picky Eater Mode (Kids Friendly)", value=True)
 
 if r_df.empty:
     st.info("No recipes found in Supabase.")
 else:
-    # Ranking
     r_df['rank'] = r_df.apply(lambda x: 0 if str(x.get('meal_name', '')).lower().strip() in recent_meals else (2 if x.get('favorite', False) else 1), axis=1)
     sorted_recipes = r_df.sort_values(['rank', 'meal_name'], ascending=[False, True])
 
-    # --- CATEGORIZATION LOGIC ---
     ready_to_cook = []
     missing_ingredients = []
 
     for _, row in sorted_recipes.iterrows():
         meal_name = str(row.get('meal_name', 'Unknown'))
         is_picky = str(row.get('picky_friendly', 'false')).lower() == 'true'
-        
-        if picky_mode and not is_picky:
-            continue
+        if picky_mode and not is_picky: continue
         
         raw_ings = str(row.get('ingredients_list', '')).split(",")
         parsed_ings = []
@@ -83,117 +155,48 @@ else:
         
         for item in raw_ings:
             if ":" in item:
-                name_part, qty_part = item.split(":")
-                name = name_part.strip()
+                n_p, q_p = item.split(":")
+                n = n_p.strip()
                 try:
-                    req_qty = int(qty_part.strip())
-                    actual_qty = pantry_dict.get(name.lower(), 0)
-                    has_enough = actual_qty >= req_qty
+                    rq = int(q_p.strip())
+                    aq = pantry_dict.get(n.lower(), 0)
+                    has_enough = aq >= rq
                     if not has_enough: can_cook = False
-                    
-                    parsed_ings.append({
-                        "display": f"{name}: {req_qty} (Have: {actual_qty})",
-                        "status": "✅" if has_enough else "❌"
-                    })
-                except:
-                    can_cook = False
+                    parsed_ings.append({"display": f"{n}: {rq} (Have: {aq})", "status": "✅" if has_enough else "❌"})
+                except: can_cook = False
         
-        meal_data = {"row": row, "parsed_ings": parsed_ings, "meal_name": meal_name}
-        if can_cook:
-            ready_to_cook.append(meal_data)
-        else:
-            missing_ingredients.append(meal_data)
+        m_data = {"row": row, "parsed_ings": parsed_ings, "meal_name": meal_name}
+        if can_cook: ready_to_cook.append(m_data)
+        else: missing_ingredients.append(m_data)
 
-    # --- DISPLAY TABS ---
-    tab1, tab2 = st.tabs([f"✅ Ready to Cook ({len(ready_to_cook)})", f"🛒 Missing Ingredients ({len(missing_ingredients)})"])
+    tab1, tab2 = st.tabs([f"✅ Ready to Cook ({len(ready_to_cook)})", f"🛒 Other Recipes ({len(missing_ingredients)})"])
 
     with tab1:
         if not ready_to_cook:
-            st.warning("Nothing ready to cook! Check your pantry or 'Missing Ingredients' tab.")
+            st.warning("Nothing ready. Update pantry or check the next tab!")
         else:
             cols = st.columns(2)
             for i, meal in enumerate(ready_to_cook):
-                m_name = meal['meal_name']
-                # Create a safe, unique key using index + name
-                safe_key = f"ready_btn_{i}_{m_name.replace(' ', '_').lower()}"
-                
-                with cols[i % 2].expander(f"🍲 {m_name}"):
-                    for ing in meal['parsed_ings']:
-                        st.write(f"{ing['status']} {ing['display']}")
-                    
-                    if st.button(f"Cook {m_name}", key=safe_key):
-                        try:
-                            # Deduct from Supabase
-                            for item in str(meal['row']['ingredients_list']).split(","):
-                                if ":" in item:
-                                    n, q = item.split(":")
-                                    n = n.strip()
-                                    current_qty = pantry_dict.get(n.lower(), 0)
-                                    new_val = current_qty - int(q.strip())
-                                    supabase.table("pantry").update({"amount": new_val}).eq("ingredient", n).execute()
-                            
-                            # Log History
-                            supabase.table("history").insert({
-                                "meal_name": m_name, 
-                                "date_cooked": datetime.now().strftime("%Y-%m-%d")
-                            }).execute()
-                            
-                            st.balloons()
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error updating: {e}")
+                m_n = meal['meal_name']
+                s_key = f"ready_btn_{i}_{m_n.replace(' ', '_').lower()}"
+                with cols[i % 2].expander(f"🍲 {m_n}"):
+                    for ing in meal['parsed_ings']: st.write(f"{ing['status']} {ing['display']}")
+                    if st.button(f"Cook {m_n}", key=s_key):
+                        for item in str(meal['row']['ingredients_list']).split(","):
+                            if ":" in item:
+                                n, q = item.split(":")
+                                n = n.strip()
+                                nv = pantry_dict.get(n.lower(), 0) - int(q.strip())
+                                supabase.table("pantry").update({"amount": nv}).eq("ingredient", n).execute()
+                        supabase.table("history").insert({"meal_name": m_n, "date_cooked": datetime.now().strftime("%Y-%m-%d")}).execute()
+                        st.balloons()
+                        st.rerun()
 
     with tab2:
-        if not missing_ingredients:
-            st.success("You have everything for all your recipes!")
-        else:
-            cols = st.columns(2)
-            for i, meal in enumerate(missing_ingredients):
-                m_name = meal['meal_name']
-                # Create a safe, unique key using index + name
-                safe_key_missing = f"missing_btn_{i}_{m_name.replace(' ', '_').lower()}"
-                
-                with cols[i % 2].expander(f"❌ {m_name}"):
-                    st.write("**Missing Items:**")
-                    for ing in meal['parsed_ings']:
-                        st.write(f"{ing['status']} {ing['display']}")
-                    
-                    # Disabled button with unique key
-                    st.button(f"Insufficient Stock", key=safe_key_missing, disabled=True)
-
-# --- 6. SMART SHOPPING LIST LOGIC ---
-shopping_list = {}
-
-for meal in missing_ingredients:
-    for ing in meal['parsed_ings']:
-        if "❌" in ing['status']:
-            # Extract name and quantities from the display string "Name: Req (Have: Actual)"
-            # This logic finds how many more you need to buy
-            name_part = ing['display'].split(":")[0]
-            req_qty = int(ing['display'].split(":")[1].split("(")[0].strip())
-            actual_qty = int(ing['display'].split("Have:")[1].replace(")", "").strip())
-            
-            shortfall = req_qty - actual_qty
-            
-            # Aggregate: If multiple recipes need the same missing item, it sums them up
-            if name_part in shopping_list:
-                shopping_list[name_part] += shortfall
-            else:
-                shopping_list[name_part] = shortfall
-
-# --- 7. UI FOR SHOPPING LIST ---
-with st.expander("🛒 View Smart Shopping List"):
-    if not shopping_list:
-        st.success("Your pantry is fully stocked for all recipes!")
-    else:
-        st.write("Based on your **Missing Ingredients**, you need to buy:")
-        
-        # Create a clean text block for easy copy-pasting
-        copy_text = ""
-        for item, qty in shopping_list.items():
-            st.checkbox(f"**{item}**: {qty} more needed", key=f"shop_{item}")
-            copy_text += f"- {item}: {qty}\n"
-        
-        st.divider()
-        st.caption("Copy this to your Notes or Viber:")
-        st.code(copy_text, language="text")
+        cols = st.columns(2)
+        for i, meal in enumerate(missing_ingredients):
+            m_n = meal['meal_name']
+            s_key_m = f"missing_btn_{i}_{m_n.replace(' ', '_').lower()}"
+            with cols[i % 2].expander(f"❌ {m_n}"):
+                for ing in meal['parsed_ings']: st.write(f"{ing['status']} {ing['display']}")
+                st.button(f"Insufficient Stock", key=s_key_m, disabled=True)
