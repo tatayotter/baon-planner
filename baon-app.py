@@ -6,11 +6,11 @@ from datetime import datetime, timedelta
 # --- 1. APP CONFIG ---
 st.set_page_config(page_title="Pinoy Baon Master", page_icon="🍱", layout="centered")
 
-# --- 2. CONNECTION ---
+# --- 2. DATA CONNECTION ---
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1DgVuak6x-AHQcltPoK8fB25T644lTUbkeiH3E3KiMYc/edit"
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Load data with NO caching to ensure we see updates immediately
+# TTL=0 is critical to ensure it doesn't show "Old" data after a cook
 pantry_df = conn.read(spreadsheet=SHEET_URL, worksheet="Pantry", ttl=0)
 recipes_df = conn.read(spreadsheet=SHEET_URL, worksheet="Recipes", ttl=0)
 try:
@@ -18,7 +18,7 @@ try:
 except:
     history_df = pd.DataFrame(columns=['Meal_Name', 'Date_Cooked'])
 
-# Clean and prepare Pantry
+# Process Pantry
 pantry_df = pantry_df.dropna(subset=['Ingredient'])
 pantry = pantry_df.set_index('Ingredient')['Amount'].to_dict()
 
@@ -29,7 +29,8 @@ recent_meals = history_df[history_df['Date_Cooked'] > five_days_ago]['Meal_Name'
 
 def get_score(row):
     if row['Meal_Name'] in recent_meals: return 0
-    return 2 if str(row.get('Favorite', 'FALSE')).upper() == 'TRUE' else 1
+    is_fav = str(row.get('Favorite', 'FALSE')).upper() == 'TRUE'
+    return 2 if is_fav else 1
 
 recipes_df['Sort_Order'] = recipes_df.apply(get_score, axis=1)
 sorted_recipes = recipes_df.sort_values(by='Sort_Order', ascending=False)
@@ -38,66 +39,64 @@ sorted_recipes = recipes_df.sort_values(by='Sort_Order', ascending=False)
 st.title("🍱 Pinoy Baon Master")
 picky_mode = st.toggle("Picky Eater Mode (Kids Only)", value=True)
 
+# Use a loop to display meals
 for index, row in sorted_recipes.iterrows():
-    # Picky Filter
-    is_picky = str(row.get('Picky_Friendly', 'FALSE')).upper() == 'TRUE'
-    if picky_mode and not is_picky: continue
+    # Filter for Picky
+    if picky_mode and str(row.get('Picky_Friendly', 'FALSE')).upper() != 'TRUE':
+        continue
     
-    # Process ingredients
-    raw_ingreds = str(row['Ingredients_List'])
-    items = [i.strip() for i in raw_ingreds.split(",")]
+    # Check Ingredients
+    raw_ing = str(row['Ingredients_List'])
+    ing_items = [i.strip() for i in raw_ing.split(",")]
 
-    # Stock Check
     can_cook = True
-    for itm in items:
-        if ":" in itm:
-            name, qty = itm.split(":")
+    missing_stock = []
+    for item in ing_items:
+        if ":" in item:
+            name, qty = item.split(":")
+            # Convert to int to ensure math works
             if pantry.get(name.strip(), 0) < int(qty.strip()):
                 can_cook = False
+                missing_stock.append(name.strip())
 
     if can_cook:
         is_fav = str(row.get('Favorite', 'FALSE')).upper() == 'TRUE'
-        label = f"⏳ {row['Meal_Name']}" if row['Meal_Name'] in recent_meals else (f"⭐ {row['Meal_Name']}" if is_fav else row['Meal_Name'])
-
-        with st.expander(label):
-            # Favorite Toggle
-            if st.checkbox("Favorite ⭐", value=is_fav, key=f"f_{index}") != is_fav:
-                recipes_df.at[index, 'Favorite'] = not is_fav
-                conn.update(spreadsheet=SHEET_URL, worksheet="Recipes", data=recipes_df.drop(columns=['Sort_Order']))
-                st.rerun()
-
-            st.write(f"**Ingredients:** {raw_ingreds}")
+        icon = "⏳" if row['Meal_Name'] in recent_meals else ("⭐" if is_fav else "🍲")
+        
+        with st.expander(f"{icon} {row['Meal_Name']}"):
+            st.write(f"**Ingredients:** {raw_ing}")
             
-            # THE COOK BUTTON
-            if st.button(f"Cook {row['Meal_Name']}", key=f"btn_{index}"):
-                # 1. Deduct from local dictionary
-                for itm in items:
-                    if ":" in itm:
-                        n, q = itm.split(":")
-                        pantry[n.strip()] = int(pantry.get(n.strip(), 0)) - int(q.strip())
+            # THE COOK BUTTON (Unique per row)
+            if st.button(f"Confirm Cook: {row['Meal_Name']}", key=f"cook_{index}"):
+                # 1. Deduct locally
+                for item in ing_items:
+                    if ":" in item:
+                        n, q = item.split(":")
+                        pantry[n.strip()] = int(pantry[n.strip()]) - int(q.strip())
                 
-                # 2. Update History
-                new_entry = pd.DataFrame([[row['Meal_Name'], datetime.now().strftime("%Y-%m-%d")]], 
-                                       columns=['Meal_Name', 'Date_Cooked'])
-                updated_history = pd.concat([history_df, new_entry], ignore_index=True)
+                # 2. Add to History locally
+                new_row = pd.DataFrame([[row['Meal_Name'], datetime.now().strftime("%Y-%m-%d")]], 
+                                     columns=['Meal_Name', 'Date_Cooked'])
+                new_history_df = pd.concat([history_df, new_row], ignore_index=True)
                 
-                # 3. Prepare dataframes for upload
+                # 3. Format DataFrames for Sheet
                 new_pantry_df = pd.DataFrame(list(pantry.items()), columns=['Ingredient', 'Amount'])
                 
-                # 4. FORCE UPDATE TO SHEETS
-                st.write("🔄 Syncing with Google Sheets...")
-                conn.update(spreadsheet=SHEET_URL, worksheet="Pantry", data=new_pantry_df)
-                conn.update(spreadsheet=SHEET_URL, worksheet="History", data=updated_history)
-                
-                st.balloons()
-                st.success(f"Successfully cooked {row['Meal_Name']}!")
-                st.rerun()
+                # 4. PUSH TO SHEETS
+                try:
+                    conn.update(spreadsheet=SHEET_URL, worksheet="Pantry", data=new_pantry_df)
+                    conn.update(spreadsheet=SHEET_URL, worksheet="History", data=new_history_df)
+                    st.success("Updating Sheets...")
+                    st.balloons()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Write Error: {e}")
 
 # --- 5. SIDEBAR ---
 with st.sidebar:
-    st.header("🏠 Pantry Inventory")
+    st.header("🏠 Pantry")
     st.dataframe(pd.DataFrame(list(pantry.items()), columns=['Item', 'Qty']), hide_index=True)
     
-    st.header("📜 Last 5 Meals")
+    st.header("📜 History")
     if not history_df.empty:
         st.write(history_df.sort_values(by='Date_Cooked', ascending=False).head(5))
