@@ -160,3 +160,40 @@ else:
                     
                     # Disabled button with unique key
                     st.button(f"Insufficient Stock", key=safe_key_missing, disabled=True)
+
+# --- 6. SMART SHOPPING LIST LOGIC ---
+shopping_list = {}
+
+for meal in missing_ingredients:
+    for ing in meal['parsed_ings']:
+        if "❌" in ing['status']:
+            # Extract name and quantities from the display string "Name: Req (Have: Actual)"
+            # This logic finds how many more you need to buy
+            name_part = ing['display'].split(":")[0]
+            req_qty = int(ing['display'].split(":")[1].split("(")[0].strip())
+            actual_qty = int(ing['display'].split("Have:")[1].replace(")", "").strip())
+            
+            shortfall = req_qty - actual_qty
+            
+            # Aggregate: If multiple recipes need the same missing item, it sums them up
+            if name_part in shopping_list:
+                shopping_list[name_part] += shortfall
+            else:
+                shopping_list[name_part] = shortfall
+
+# --- 7. UI FOR SHOPPING LIST ---
+with st.expander("🛒 View Smart Shopping List"):
+    if not shopping_list:
+        st.success("Your pantry is fully stocked for all recipes!")
+    else:
+        st.write("Based on your **Missing Ingredients**, you need to buy:")
+        
+        # Create a clean text block for easy copy-pasting
+        copy_text = ""
+        for item, qty in shopping_list.items():
+            st.checkbox(f"**{item}**: {qty} more needed", key=f"shop_{item}")
+            copy_text += f"- {item}: {qty}\n"
+        
+        st.divider()
+        st.caption("Copy this to your Notes or Viber:")
+        st.code(copy_text, language="text")
