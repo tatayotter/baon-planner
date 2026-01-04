@@ -6,21 +6,21 @@ from datetime import datetime, timedelta
 # --- 1. APP CONFIG ---
 st.set_page_config(page_title="Pinoy Baon Master", page_icon="🍱", layout="centered")
 
-# --- 2. CONNECTION ---
+# --- 2. CONNECTION (Forced Refresh) ---
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1DgVuak6x-AHQcltPoK8fB25T644lTUbkeiH3E3KiMYc/edit"
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-def load_data():
-    p = conn.read(spreadsheet=SHEET_URL, worksheet="Pantry", ttl=0)
-    r = conn.read(spreadsheet=SHEET_URL, worksheet="Recipes", ttl=0)
-    try:
-        h = conn.read(spreadsheet=SHEET_URL, worksheet="History", ttl=0)
-    except:
-        h = pd.DataFrame(columns=['Meal_Name', 'Date_Cooked'])
-    return p, r, h
+# We use ttl=0 to ensure we ALWAYS get the latest data from the sheet
+pantry_df = conn.read(spreadsheet=SHEET_URL, worksheet="Pantry", ttl=0)
+recipes_df = conn.read(spreadsheet=SHEET_URL, worksheet="Recipes", ttl=0)
+try:
+    history_df = conn.read(spreadsheet=SHEET_URL, worksheet="History", ttl=0)
+except:
+    history_df = pd.DataFrame(columns=['Meal_Name', 'Date_Cooked'])
 
-pantry_df, recipes_df, history_df = load_data()
-pantry = pantry_df.dropna(subset=['Ingredient']).set_index('Ingredient')['Amount'].to_dict()
+# Process Pantry
+pantry_df = pantry_df.dropna(subset=['Ingredient'])
+pantry = pantry_df.set_index('Ingredient')['Amount'].to_dict()
 
 # --- 3. SORTING ---
 history_df['Date_Cooked'] = pd.to_datetime(history_df['Date_Cooked'], errors='coerce')
@@ -41,11 +41,9 @@ picky_mode = st.toggle("Picky Eater Mode", value=True)
 for index, row in sorted_recipes.iterrows():
     if picky_mode and not str(row.get('Picky_Friendly', 'FALSE')).upper() == 'TRUE': continue
     
-    # Inline ingredients display
     raw_ing = str(row['Ingredients_List'])
     ing_items = [i.strip() for i in raw_ing.split(",")]
 
-    # Stock Check
     can_cook = True
     for item in ing_items:
         if ":" in item:
@@ -67,33 +65,36 @@ for index, row in sorted_recipes.iterrows():
 
             st.write(f"**Ingredients:** {raw_ing}")
             
+            # --- THE COOK BUTTON ---
             if st.button(f"Cook {row['Meal_Name']}", key=f"btn_{index}"):
-                with st.spinner('Updating Google Sheets...'):
-                    try:
-                        # 1. Update Local Pantry
-                        for item in ing_items:
-                            if ":" in item:
-                                n, q = item.split(":")
-                                pantry[n.strip()] -= int(q.strip())
-                        
-                        # 2. Add to History
-                        new_h = pd.DataFrame([[row['Meal_Name'], datetime.now().strftime("%Y-%m-%d")]], columns=['Meal_Name', 'Date_Cooked'])
-                        full_history = pd.concat([history_df, new_h], ignore_index=True)
-                        
-                        # 3. PUSH TO GOOGLE SHEETS
-                        conn.update(spreadsheet=SHEET_URL, worksheet="Pantry", data=pd.DataFrame(list(pantry.items()), columns=['Ingredient', 'Amount']))
-                        conn.update(spreadsheet=SHEET_URL, worksheet="History", data=full_history)
-                        
-                        st.balloons()
-                        st.success("Sheet Updated Successfully!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to update Sheet: {e}")
+                st.toast(f"Cooking {row['Meal_Name']}... Please wait.")
+                
+                # 1. Update Local Pantry
+                for item in ing_items:
+                    if ":" in item:
+                        n, q = item.split(":")
+                        pantry[name.strip()] = pantry.get(n.strip(), 0) - int(q.strip())
+                
+                # 2. Update Local History
+                new_h = pd.DataFrame([[row['Meal_Name'], datetime.now().strftime("%Y-%m-%d")]], 
+                                     columns=['Meal_Name', 'Date_Cooked'])
+                updated_history_df = pd.concat([history_df, new_h], ignore_index=True)
+                
+                # 3. CONVERT BACK TO DATAFRAME FOR SHEET
+                updated_pantry_df = pd.DataFrame(list(pantry.items()), columns=['Ingredient', 'Amount'])
+                
+                # 4. PUSH TO GOOGLE SHEETS
+                conn.update(spreadsheet=SHEET_URL, worksheet="Pantry", data=updated_pantry_df)
+                conn.update(spreadsheet=SHEET_URL, worksheet="History", data=updated_history_df)
+                
+                st.balloons()
+                st.success("Meal Logged!")
+                st.rerun()
 
 # --- 5. SIDEBAR ---
 with st.sidebar:
     st.header("🏠 Pantry Inventory")
-    st.table(pd.DataFrame(list(pantry.items()), columns=['Item', 'Qty']))
+    st.dataframe(pd.DataFrame(list(pantry.items()), columns=['Item', 'Qty']), hide_index=True)
     
     st.header("📜 Recent History")
     if not history_df.empty:
