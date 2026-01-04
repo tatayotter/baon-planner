@@ -2,6 +2,7 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import datetime, timedelta
+import re
 
 # --- 1. APP CONFIGURATION ---
 st.set_page_config(page_title="Pinoy Baon Master", page_icon="🍱", layout="centered")
@@ -23,7 +24,7 @@ except Exception as e:
     st.error(f"Sheet Error: {e}")
     st.stop()
 
-# --- 3. COOLDOWN LOGIC (5 Days) ---
+# --- 3. COOLDOWN LOGIC ---
 history_df['Date_Cooked'] = pd.to_datetime(history_df['Date_Cooked'])
 recent_meals = history_df[history_df['Date_Cooked'] > (datetime.now() - timedelta(days=5))]['Meal_Name'].unique()
 
@@ -41,17 +42,16 @@ picky_mode = st.toggle("Picky Eater Mode", value=True)
 for index, row in sorted_recipes.iterrows():
     if picky_mode and not row['Picky_Friendly']: continue
     
-    # Check Ingredients String
-    raw_ingredients = str(row['Ingredients_List'])
-    
-    # MANUAL SPLIT LOGIC: We replace common separators with a standard pipe |
-    # then split it into a clean list
-    clean_text = raw_ingredients.replace(";", ",").replace("\n", ",")
-    items = [i.strip() for i in clean_text.split(",") if i.strip()]
+    # --- THE SUPER PARSER ---
+    # This looks for almost ANY symbol you might have used to separate ingredients
+    raw_text = str(row['Ingredients_List'])
+    # Split by: comma, semicolon, newline, or a slash
+    items = re.split(r'[,;\n/]', raw_text)
+    clean_items = [i.strip() for i in items if i.strip()]
 
     # Check if we can cook it
     can_cook = True
-    for item in items:
+    for item in clean_items:
         if ":" in item:
             name, qty = item.split(":")
             if pantry.get(name.strip(), 0) < int(qty.strip()):
@@ -59,10 +59,7 @@ for index, row in sorted_recipes.iterrows():
 
     if can_cook:
         is_fav = str(row.get('Favorite')).upper() == 'TRUE'
-        is_recent = row['Meal_Name'] in recent_meals
-        
-        # UI Labels
-        label = f"⏳ {row['Meal_Name']}" if is_recent else (f"⭐ {row['Meal_Name']}" if is_fav else row['Meal_Name'])
+        label = f"⏳ {row['Meal_Name']}" if row['Meal_Name'] in recent_meals else (f"⭐ {row['Meal_Name']}" if is_fav else row['Meal_Name'])
 
         with st.expander(label):
             # Favorite Toggle
@@ -71,27 +68,28 @@ for index, row in sorted_recipes.iterrows():
                 conn.update(spreadsheet=SHEET_URL, worksheet="Recipes", data=recipes_df.drop(columns=['Sort_Score']))
                 st.rerun()
 
+            st.write("---")
             st.write("**Ingredients Required:**")
             
-            # --- THE "FORCE-BREAK" DISPLAY ---
-            # This loop prints each item one by one. 
-            # In Streamlit, calling st.write multiple times GUARANTEES separate lines.
-            for single_item in items:
-                st.write(f"• {single_item}")
+            # --- THE "UNBREAKABLE" VERTICAL LOOP ---
+            # By calling st.info() or st.text() inside a loop, Streamlit 
+            # is forced to create a separate UI block for every single item.
+            for single_ingredient in clean_items:
+                st.info(single_ingredient) # Using st.info makes it look like a list of cards
             
-            st.divider()
-            
+            st.write("") # Spacer
+
             if st.button(f"Cook {row['Meal_Name']}", key=f"b{index}"):
-                for item in items:
-                    name, qty = item.split(":")
-                    pantry[name.strip()] -= int(qty.strip())
+                for item in clean_items:
+                    if ":" in item:
+                        name, qty = item.split(":")
+                        pantry[name.strip()] -= int(qty.strip())
                 
                 # Update History & Pantry
                 new_log = pd.DataFrame([[row['Meal_Name'], datetime.now()]], columns=['Meal_Name', 'Date_Cooked'])
                 updated_history = pd.concat([history_df, new_log])
                 conn.update(spreadsheet=SHEET_URL, worksheet="Pantry", data=pd.DataFrame(list(pantry.items()), columns=['Ingredient', 'Amount']))
                 conn.update(spreadsheet=SHEET_URL, worksheet="History", data=updated_history)
-                st.balloons()
                 st.rerun()
 
 # --- 5. SIDEBAR ---
