@@ -1,48 +1,70 @@
 import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
+from datetime import datetime, timedelta
 
-# --- APP CONFIG ---
+# --- 1. APP CONFIGURATION ---
 st.set_page_config(
     page_title="Pinoy Baon Master",
     page_icon="🍱",
     layout="centered"
 )
 
-# --- 1. CONNECTION & SHEET LINK ---
-# Ensure this matches your actual Sheet URL
+# --- 2. CONNECTION & DATA LOADING ---
+# Ensure this matches your specific Sheet URL
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1DgVuak6x-AHQcltPoK8fB25T644lTUbkeiH3E3KiMYc/edit"
-
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# --- 2. LOAD DATA ---
 try:
-    # Reading tabs - Names must be exactly "Pantry" and "Recipes"
+    # Load all three worksheets
     pantry_df = conn.read(spreadsheet=SHEET_URL, worksheet="Pantry", ttl=0)
     recipes_df = conn.read(spreadsheet=SHEET_URL, worksheet="Recipes", ttl=0)
     
-    # Cleaning data
+    try:
+        history_df = conn.read(spreadsheet=SHEET_URL, worksheet="History", ttl=0)
+    except:
+        # Create empty history if tab exists but has no data yet
+        history_df = pd.DataFrame(columns=['Meal_Name', 'Date_Cooked'])
+
+    # Data Cleaning
     pantry_df = pantry_df.dropna(subset=['Ingredient'])
     recipes_df = recipes_df.dropna(subset=['Meal_Name'])
-    
-    # Create dictionary for logic: { 'Chicken': 1000, 'Eggs': 12 }
     pantry = pantry_df.set_index('Ingredient')['Amount'].to_dict()
+
 except Exception as e:
-    st.error("⚠️ Connection Error!")
-    st.info("Check: Is the sheet shared with your Service Account email as Editor?")
-    st.code(e)
+    st.error("⚠️ Connection Error! Please check your Google Sheet tabs and Service Account permissions.")
     st.stop()
 
-# --- 3. UI HEADER ---
-st.title("🍱 Pinoy Baon Master")
-st.write(f"Planning for your 7 & 9 year olds.")
+# --- 3. SORTING LOGIC (Cooldown vs. Favorites) ---
+# Convert history dates to datetime objects for calculation
+history_df['Date_Cooked'] = pd.to_datetime(history_df['Date_Cooked'])
+five_days_ago = datetime.now() - timedelta(days=5)
 
-# Toggle for Picky Eaters
-picky_mode = st.toggle("Picky Eater Mode (Kids Only)", value=True)
+# Identify meals cooked in the last 5 days
+recent_meals = history_df[history_df['Date_Cooked'] > five_days_ago]['Meal_Name'].unique()
 
-# --- 4. HELPER LOGIC ---
+def get_sort_score(row):
+    """
+    Priority Hierarchy:
+    Score 0: Recently Cooked (Always at the bottom)
+    Score 2: Favorite AND not recently cooked (Top)
+    Score 1: Standard meal AND not recently cooked (Middle)
+    """
+    if row['Meal_Name'] in recent_meals:
+        return 0  # Forced to the bottom
+    
+    # Handle both Boolean and String "TRUE" from Google Sheets
+    is_fav = str(row.get('Favorite')).upper() == 'TRUE'
+    if is_fav:
+        return 2  # Priority
+    return 1      # Normal
+
+recipes_df['Sort_Score'] = recipes_df.apply(get_sort_score, axis=1)
+sorted_recipes = recipes_df.sort_values(by='Sort_Score', ascending=False)
+
+# --- 4. HELPER FUNCTIONS ---
 def can_cook(ingredients_str):
-    """Checks if current pantry has enough for the recipe"""
+    """Checks if enough ingredients exist in the pantry dictionary."""
     try:
         items = ingredients_str.split(",")
         for pair in items:
@@ -54,68 +76,93 @@ def can_cook(ingredients_str):
     except:
         return False
 
-# --- 5. MAIN DISPLAY: MEAL SELECTION ---
+# --- 5. MAIN UI ---
+st.title("🍱 Pinoy Baon Master")
+st.write(f"Today is {datetime.now().strftime('%A, %b %d, %Y')}")
+
+# User Controls
+picky_mode = st.toggle("Picky Eater Mode (Kids Only)", value=True)
+
 st.subheader("🍳 Available Meals")
-st.caption("Click a meal to see the ingredients list.")
+st.caption("Favorites ⭐ are at the top. Meals cooked within the last 5 days ⏳ move to the bottom.")
+
+
 
 found_any = False
-for _, row in recipes_df.iterrows():
+for index, row in sorted_recipes.iterrows():
     # Filter by Picky Mode
     if picky_mode and not row['Picky_Friendly']:
         continue
     
-    # Check if ingredients are sufficient
+    # Only display if we have ingredients
     if can_cook(row['Ingredients_List']):
         found_any = True
-        with st.expander(f"✅ {row['Meal_Name']}"):
-            st.write("**Ingredients Required:**")
+        
+        is_fav = str(row.get('Favorite')).upper() == 'TRUE'
+        is_recent = row['Meal_Name'] in recent_meals
+        
+        # Determine Label Icon
+        if is_recent:
+            display_label = f"⏳ {row['Meal_Name']} (Cooldown)"
+        elif is_fav:
+            display_label = f"⭐ {row['Meal_Name']}"
+        else:
+            display_label = row['Meal_Name']
+
+        with st.expander(display_label):
+            # FAVORITE TOGGLE
+            # checkbox key uses index to ensure uniqueness
+            new_fav_state = st.checkbox("Mark as Favorite", value=is_fav, key=f"fav_{index}")
             
-            # --- FORMATTED LIST DISPLAY ---
+            if new_fav_state != is_fav:
+                # Update the source dataframe
+                recipes_df.at[index, 'Favorite'] = new_fav_state
+                # Remove Sort_Score before saving back to GSheets
+                save_df = recipes_df.drop(columns=['Sort_Score'])
+                conn.update(spreadsheet=SHEET_URL, worksheet="Recipes", data=save_df)
+                st.rerun()
+
+            st.write("**Ingredients Required:**")
             ingredient_items = row['Ingredients_List'].split(",")
             for item in ingredient_items:
                 st.write(f"• {item.strip()}")
             
-            if st.button(f"Cook {row['Meal_Name']}", key=row['Meal_Name']):
-                # Deduct ingredients from the local dictionary
+            # COOK BUTTON
+            if st.button(f"Cook {row['Meal_Name']}", key=f"btn_{index}"):
+                # 1. Deduct from local dictionary
                 for pair in ingredient_items:
                     name, qty = pair.split(":")
                     pantry[name.strip()] -= int(qty.strip())
                 
-                # Push updated levels back to Google Sheets
-                final_df = pd.DataFrame(list(pantry.items()), columns=['Ingredient', 'Amount'])
-                conn.update(spreadsheet=SHEET_URL, worksheet="Pantry", data=final_df)
+                # 2. Add entry to History
+                new_log = pd.DataFrame([[row['Meal_Name'], datetime.now().strftime("%Y-%m-%d %H:%M:%S")]], 
+                                     columns=['Meal_Name', 'Date_Cooked'])
+                updated_history = pd.concat([history_df, new_log], ignore_index=True)
+                
+                # 3. Batch Update Google Sheets
+                updated_pantry_df = pd.DataFrame(list(pantry.items()), columns=['Ingredient', 'Amount'])
+                conn.update(spreadsheet=SHEET_URL, worksheet="Pantry", data=updated_pantry_df)
+                conn.update(spreadsheet=SHEET_URL, worksheet="History", data=updated_history)
                 
                 st.balloons()
-                st.success(f"Deducted ingredients for {row['Meal_Name']}!")
                 st.rerun()
 
 if not found_any:
-    st.warning("No meals available. Check your Pantry stock or add more recipes!")
+    st.info("No meals currently available based on your pantry stock.")
 
-# --- 6. SIDEBAR: INVENTORY VIEW ---
+# --- 6. SIDEBAR: INVENTORY TRACKER ---
 with st.sidebar:
-    st.header("🏠 Current Pantry")
-    st.write("Live stock levels from your sheet.")
+    st.header("🏠 Pantry Inventory")
+    st.write("Current stock levels:")
     
-    # Display inventory with color coding for low stock
     for item, qty in pantry.items():
         if qty <= 0:
-            st.error(f"{item}: {qty} (OUT)")
+            st.error(f"{item}: {qty}")
         elif qty < 100:
-            st.warning(f"{item}: {qty} (LOW)")
+            st.warning(f"{item}: {qty}")
         else:
             st.write(f"**{item}**: {qty}")
             
-    if st.button("🔄 Refresh Data"):
+    st.divider()
+    if st.button("🔄 Sync with Google Sheets"):
         st.rerun()
-
-# --- 7. SHOPPING LIST ---
-st.divider()
-st.subheader("🛒 Shopping List")
-out_of_stock = [item for item, qty in pantry.items() if qty <= 0]
-
-if out_of_stock:
-    for item in out_of_stock:
-        st.write(f"- [ ] **{item}**")
-else:
-    st.success("Everything is in stock!")
