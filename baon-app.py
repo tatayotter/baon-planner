@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 # --- 1. CONNECTION & CONFIG ---
 st.set_page_config(page_title="Pinoy Baon Master", page_icon="🍱", layout="wide")
 
-# Initialize Supabase
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
@@ -22,7 +21,6 @@ def load_all_data():
         r_df = pd.DataFrame(r_res.data) if r_res.data else pd.DataFrame()
         h_df = pd.DataFrame(h_res.data) if h_res.data else pd.DataFrame(columns=['meal_name', 'date_cooked'])
         
-        # Normalize columns (lowercase and strip spaces)
         for df in [p_df, r_df, h_df]:
             if not df.empty:
                 df.columns = [str(c).lower().strip().replace(" ", "_") for c in df.columns]
@@ -33,112 +31,112 @@ def load_all_data():
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 p_df, r_df, h_df = load_all_data()
-
-# Create a normalized pantry dictionary for logic
-# Key: 'rice', Value: 5
-pantry_dict = {str(k).lower().strip(): v for k, v in p_df.set_index('ingredient')['amount'].to_dict().items()} if not p_df.empty and 'ingredient' in p_df.columns else {}
+pantry_dict = {str(k).lower().strip(): v for k, v in p_df.set_index('ingredient')['amount'].to_dict().items()} if not p_df.empty else {}
 
 # --- 3. COOLDOWN LOGIC ---
 recent_meals = []
-if not h_df.empty and 'meal_name' in h_df.columns:
+if not h_df.empty:
     h_df['date_cooked'] = pd.to_datetime(h_df['date_cooked'])
-    cooldown_date = datetime.now() - timedelta(days=5)
-    recent_meals = [str(m).lower().strip() for m in h_df[h_df['date_cooked'] > cooldown_date]['meal_name'].unique()]
+    limit = datetime.now() - timedelta(days=5)
+    recent_meals = [str(m).lower().strip() for m in h_df[h_df['date_cooked'] > limit]['meal_name'].unique()]
 
-# --- 4. SIDEBAR (Inventory & History) ---
+# --- 4. SIDEBAR ---
 with st.sidebar:
     st.header("🏠 Pantry Inventory")
-    
     if not p_df.empty:
-        st.subheader("Edit Quantities")
-        # Ensure ingredient is available for the editor
-        edited_pantry = st.data_editor(
-            p_df, 
-            column_config={"amount": st.column_config.NumberColumn(min_value=0)},
-            hide_index=True,
-            key="pantry_editor"
-        )
+        edited_pantry = st.data_editor(p_df, hide_index=True, key="pantry_editor")
         if st.button("Save Pantry Changes"):
             for _, row in edited_pantry.iterrows():
                 supabase.table("pantry").update({"amount": row['amount']}).eq("ingredient", row['ingredient']).execute()
-            st.success("Saved!")
             st.rerun()
     
-    st.divider()
-    
-    st.subheader("➕ Add New Item")
-    with st.form("add_item", clear_on_submit=True):
-        new_name = st.text_input("Item Name")
-        new_qty = st.number_input("Starting Qty", min_value=0)
-        if st.form_submit_button("Add to Database"):
-            if new_name:
-                supabase.table("pantry").insert({"ingredient": new_name.strip(), "amount": new_qty}).execute()
-                st.rerun()
-
     st.divider()
     st.header("📜 History")
     if not h_df.empty:
         st.dataframe(h_df.sort_values('date_cooked', ascending=False).head(10), hide_index=True)
 
-# --- 5. MAIN UI (Meal Suggestions) ---
+# --- 5. MAIN UI ---
 st.title("🍱 Pinoy Baon Master")
 picky_mode = st.toggle("Picky Eater Mode (Kids Friendly)", value=True)
 
 if r_df.empty:
-    st.info("No recipes found in Supabase. Add rows to your 'recipes' table!")
+    st.info("No recipes found in Supabase.")
 else:
-    # Rank: 0 = Recent (Cooldown), 2 = Favorite, 1 = Normal
+    # Ranking
     r_df['rank'] = r_df.apply(lambda x: 0 if str(x.get('meal_name', '')).lower().strip() in recent_meals else (2 if x.get('favorite', False) else 1), axis=1)
-    sorted_recipes = r_df.sort_values('rank', ascending=False)
+    sorted_recipes = r_df.sort_values(['rank', 'meal_name'], ascending=[False, True])
 
-    cols = st.columns(2)
-    col_idx = 0
+    # --- CATEGORIZATION LOGIC ---
+    ready_to_cook = []
+    missing_ingredients = []
 
     for _, row in sorted_recipes.iterrows():
-        meal_name = str(row.get('meal_name', 'Unknown Meal'))
-        
-        # Picky Filter
+        meal_name = str(row.get('meal_name', 'Unknown'))
         is_picky = str(row.get('picky_friendly', 'false')).lower() == 'true'
+        
         if picky_mode and not is_picky:
             continue
         
-        # STOCK CHECK LOGIC
-        ing_text = str(row.get('ingredients_list', ''))
-        ings = [i.strip() for i in ing_text.split(",") if ":" in i]
+        raw_ings = str(row.get('ingredients_list', '')).split(",")
+        parsed_ings = []
         can_cook = True
         
-        if not ings: can_cook = False # Hide meals with no ingredients listed
-        
-        for itm in ings:
-            name_part, qty_part = itm.split(":")
-            req_name = name_part.strip().lower()
-            try:
-                req_qty = int(qty_part.strip())
-                if pantry_dict.get(req_name, 0) < req_qty:
+        for item in raw_ings:
+            if ":" in item:
+                name_part, qty_part = item.split(":")
+                name = name_part.strip()
+                try:
+                    req_qty = int(qty_part.strip())
+                    actual_qty = pantry_dict.get(name.lower(), 0)
+                    has_enough = actual_qty >= req_qty
+                    if not has_enough: can_cook = False
+                    
+                    parsed_ings.append({
+                        "display": f"{name}: {req_qty} (Have: {actual_qty})",
+                        "status": "✅" if has_enough else "❌"
+                    })
+                except:
                     can_cook = False
-            except ValueError:
-                can_cook = False
-
+        
+        meal_data = {"row": row, "parsed_ings": parsed_ings, "meal_name": meal_name}
         if can_cook:
-            with cols[col_idx % 2].expander(f"{'⏳' if row['rank']==0 else '⭐' if row['rank']==2 else '🍲'} {meal_name}"):
-                st.write(f"**Required:** {ing_text}")
-                # UNIQUE KEY FIX: Uses meal name + rank to ensure uniqueness
-                btn_key = f"cook_{meal_name.replace(' ', '_')}_{row['rank']}"
-                if st.button(f"Cook {meal_name}", key=btn_key):
-                    try:
-                        # 1. Update Pantry (Deduct)
-                        for itm in ings:
-                            name_part, qty_part = itm.split(":")
-                            orig_name = name_part.strip()
-                            deduct_qty = int(qty_part.strip())
-                            new_val = int(pantry_dict[orig_name.lower()]) - deduct_qty
-                            supabase.table("pantry").update({"amount": new_val}).eq("ingredient", orig_name).execute()
-                        
-                        # 2. Log History
-                        supabase.table("history").insert({"meal_name": meal_name}).execute()
-                        
+            ready_to_cook.append(meal_data)
+        else:
+            missing_ingredients.append(meal_data)
+
+    # --- DISPLAY TABS ---
+    tab1, tab2 = st.tabs([f"✅ Ready to Cook ({len(ready_to_cook)})", f"🛒 Missing Ingredients ({len(missing_ingredients)})"])
+
+    with tab1:
+        if not ready_to_cook:
+            st.warning("Nothing ready to cook! Check your pantry or 'Missing Ingredients' tab.")
+        else:
+            cols = st.columns(2)
+            for i, meal in enumerate(ready_to_cook):
+                with cols[i % 2].expander(f"🍲 {meal['meal_name']}"):
+                    for ing in meal['parsed_ings']:
+                        st.write(f"{ing['status']} {ing['display']}")
+                    
+                    if st.button(f"Cook {meal['meal_name']}", key=f"ready_{meal['meal_name']}"):
+                        # Deduct and Log logic...
+                        for item in str(meal['row']['ingredients_list']).split(","):
+                            if ":" in item:
+                                n, q = item.split(":")
+                                n = n.strip()
+                                new_val = int(pantry_dict[n.lower()]) - int(q.strip())
+                                supabase.table("pantry").update({"amount": new_val}).eq("ingredient", n).execute()
+                        supabase.table("history").insert({"meal_name": meal['meal_name'], "date_cooked": datetime.now().strftime("%Y-%m-%d")}).execute()
                         st.balloons()
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Action failed: {e}")
-            col_idx += 1
+
+    with tab2:
+        if not missing_ingredients:
+            st.success("You have everything for all your recipes!")
+        else:
+            cols = st.columns(2)
+            for i, meal in enumerate(missing_ingredients):
+                with cols[i % 2].expander(f"❌ {meal['meal_name']}"):
+                    st.write("**Missing Items:**")
+                    for ing in meal['parsed_ings']:
+                        st.write(f"{ing['status']} {ing['display']}")
+                    st.button(f"Cannot Cook (Missing Ingredients)", key=f"missing_{meal['meal_name']}", disabled=True)
