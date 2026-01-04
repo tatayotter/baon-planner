@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # --- 1. CONNECTION & CONFIG ---
-st.set_page_config(page_title="Pinoy Baon Master", page_icon="🍱", layout="wide")
+st.set_page_config(page_title="Tatay's Baon Planner", page_icon="🍱", layout="wide")
 
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
@@ -64,7 +64,7 @@ with st.sidebar:
         st.dataframe(h_df.sort_values('date_cooked', ascending=False).head(10), hide_index=True)
 
 # --- 5. WEEKLY MENU BOARD ---
-st.title("🍱 Pinoy Baon Master")
+st.title("🍱 Tatay's Baon Planner")
 
 header_col, btn_col = st.columns([4, 1])
 with header_col:
@@ -200,3 +200,4 @@ else:
             with cols[i % 2].expander(f"❌ {m_n}"):
                 for ing in meal['parsed_ings']: st.write(f"{ing['status']} {ing['display']}")
                 st.button(f"Insufficient Stock", key=s_key_m, disabled=True)
+
